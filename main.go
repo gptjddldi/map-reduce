@@ -1,6 +1,10 @@
 package main
 
-import "map-reduce/mapreduce"
+import (
+	"map-reduce/mapreduce"
+	"strconv"
+	"strings"
+)
 
 // type KeyValue struct {
 // 	Key   string
@@ -170,6 +174,22 @@ import "map-reduce/mapreduce"
 // }
 
 func main() {
-	mr := mapreduce.NewMapReduce("test.txt")
+	mr := mapreduce.NewMapReduce("large_file.txt", 10, 10)
+	mr.SetMapFn(func(kv mapreduce.KeyValue) []mapreduce.KeyValue {
+		lis := strings.Split(kv.Value, " ")
+		kvs := []mapreduce.KeyValue{}
+		for _, l := range lis {
+			kvs = append(kvs, mapreduce.KeyValue{Key: l, Value: "1"})
+		}
+		return kvs
+	})
+	mr.SetReduceFn(func(key string, values []string) mapreduce.KeyValue {
+		sum := 0
+		for _, v := range values {
+			val, _ := strconv.Atoi(v)
+			sum += val
+		}
+		return mapreduce.KeyValue{Key: key, Value: strconv.Itoa(sum)}
+	})
 	mr.Run()
 }
