@@ -55,7 +55,7 @@ const (
 	Dead
 )
 
-func NewWorker(server *Server, id int, masterId int, numReduceTasks int, outputDir string) *Worker {
+func NewWorker(id int, masterId int, numReduceTasks int, outputDir string) *Worker {
 	return &Worker{
 		Id:                 id,
 		State:              Idle,
@@ -64,9 +64,12 @@ func NewWorker(server *Server, id int, masterId int, numReduceTasks int, outputD
 		numReduceTasks:     numReduceTasks,
 		outputDir:          outputDir,
 		intermediateFiles:  make(map[int]string),
-		Server:             server,
 		MasterId:           masterId,
 	}
+}
+
+func (w *Worker) SetServer(server *Server) {
+	w.Server = server
 }
 
 func (w *Worker) RegisterWorker(id int, addr net.Addr) error {

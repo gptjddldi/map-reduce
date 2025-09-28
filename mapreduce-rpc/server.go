@@ -9,33 +9,26 @@ import (
 )
 
 type Server struct {
-	serverId      string
-	NumMapWorkers int
+	serverId string
 
 	rpcServer *rpc.Server
 	listener  net.Listener
-	rpcProxy  *RPCProxy
+	handler   interface{}
 
 	peerClients map[int]*rpc.Client
 
 	mu   sync.Mutex
 	wg   sync.WaitGroup
 	quit chan struct{}
-
-	isMaster bool
-
-	worker *Worker
-	master *Master
 }
 
-func NewServer(numMapWorkers int, serverId string, isMaster bool) *Server {
+func NewServer(serverId string, handler interface{}) *Server {
 	return &Server{
-		NumMapWorkers: numMapWorkers,
-		rpcServer:     rpc.NewServer(),
-		serverId:      serverId,
-		quit:          make(chan struct{}),
-		peerClients:   make(map[int]*rpc.Client),
-		isMaster:      isMaster,
+		rpcServer:   rpc.NewServer(),
+		serverId:    serverId,
+		quit:        make(chan struct{}),
+		peerClients: make(map[int]*rpc.Client),
+		handler:     handler,
 	}
 }
 
@@ -52,13 +45,7 @@ func (s *Server) Serve() {
 
 	// Register RPC handlers
 	s.mu.Lock()
-	if s.worker != nil {
-		s.rpcProxy = &RPCProxy{worker: s.worker}
-		s.rpcServer.RegisterName("MapReduce", s.rpcProxy)
-	} else if s.master != nil {
-		s.rpcProxy = &RPCProxy{master: s.master}
-		s.rpcServer.RegisterName("MapReduce", s.rpcProxy)
-	}
+	s.rpcServer.RegisterName("MapReduce", s.handler)
 	s.mu.Unlock()
 
 	s.wg.Add(1)
@@ -83,17 +70,7 @@ func (s *Server) Serve() {
 		}
 	}()
 }
-func (s *Server) AttachWorker(w *Worker) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.worker = w
-}
 
-func (s *Server) AttachMaster(m *Master) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.master = m
-}
 func (s *Server) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -139,44 +116,4 @@ func (s *Server) Listener() net.Listener {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.listener
-}
-
-type RPCProxy struct {
-	worker *Worker
-	master *Master
-}
-
-func (rpp *RPCProxy) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
-	if rpp.worker != nil {
-		return rpp.worker.Heartbeat(args, reply)
-	}
-	return fmt.Errorf("Heartbeat not supported on master")
-}
-
-func (rpp *RPCProxy) Map(args MapArgs, reply *MapReply) error {
-	if rpp.worker != nil {
-		return rpp.worker.Map(args, reply)
-	}
-	return fmt.Errorf("Map not supported on master")
-}
-
-func (rpp *RPCProxy) Reduce(args ReduceArgs, reply *ReduceReply) error {
-	if rpp.worker != nil {
-		return rpp.worker.Reduce(args, reply)
-	}
-	return fmt.Errorf("Reduce not supported on master")
-}
-
-func (rpp *RPCProxy) GetIntermediateFiles(args GetIntermediateFilesArgs, reply *GetIntermediateFilesReply) error {
-	if rpp.worker != nil {
-		return rpp.worker.GetIntermediateFiles(args, reply)
-	}
-	return fmt.Errorf("GetIntermediateFiles not supported on master")
-}
-
-func (rpp *RPCProxy) DoneMapTask(args DoneMapTaskArgs, reply *DoneMapTaskReply) error {
-	if rpp.master != nil {
-		return rpp.master.DoneMapTask(args, reply)
-	}
-	return fmt.Errorf("DoneMapTask not supported on worker")
 }

@@ -81,10 +81,9 @@ type DoneMapTaskReply struct {
 	Success bool
 }
 
-func NewMaster(inputFilePath string, server *Server, numMapWorkers int) *Master {
+func NewMaster(inputFilePath string, numMapWorkers int) *Master {
 	return &Master{
 		inputFilePath:   inputFilePath,
-		Server:          server,
 		NumMapWorkers:   numMapWorkers,
 		WorkerStates:    make([]WorkerState, numMapWorkers),
 		completedChunks: make(map[int]bool),
@@ -92,6 +91,10 @@ func NewMaster(inputFilePath string, server *Server, numMapWorkers int) *Master 
 		stopChan:        make(chan struct{}),
 		mu:              sync.Mutex{},
 	}
+}
+
+func (m *Master) SetServer(server *Server) {
+	m.Server = server
 }
 
 // RegisterWorker connects the master's RPC client to a worker's address for the given id.
