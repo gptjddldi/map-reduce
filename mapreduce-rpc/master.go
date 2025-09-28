@@ -29,6 +29,11 @@ type Master struct {
 	completedChunks map[int]bool  // chunk index -> 완료 여부
 	allMapTasksDone chan struct{} // 모든 map task 완료 신호
 
+	// 워커별 타이머 관리
+	workerTimers     []*time.Timer // 워커별 하트비트 타이머
+	workerTimeouts   []time.Time   // 워커별 마지막 하트비트 시간
+	heartbeatTimeout time.Duration // 하트비트 타임아웃 시간
+
 	stopChan chan struct{}
 
 	wg sync.WaitGroup
@@ -36,19 +41,80 @@ type Master struct {
 }
 
 func NewMaster(inputFilePath string, numMapWorkers int) *Master {
-	return &Master{
-		inputFilePath:   inputFilePath,
-		NumMapWorkers:   numMapWorkers,
-		WorkerStates:    make([]rpc.WorkerState, numMapWorkers),
-		completedChunks: make(map[int]bool),
-		allMapTasksDone: make(chan struct{}),
-		stopChan:        make(chan struct{}),
-		mu:              sync.Mutex{},
+	master := &Master{
+		inputFilePath:    inputFilePath,
+		NumMapWorkers:    numMapWorkers,
+		WorkerStates:     make([]rpc.WorkerState, numMapWorkers+1),
+		completedChunks:  make(map[int]bool),
+		allMapTasksDone:  make(chan struct{}),
+		stopChan:         make(chan struct{}),
+		heartbeatTimeout: 200 * time.Millisecond,
+		mu:               sync.Mutex{},
 	}
+
+	master.workerTimers = make([]*time.Timer, numMapWorkers+1)
+	master.workerTimeouts = make([]time.Time, numMapWorkers+1)
+
+	for i := 1; i <= numMapWorkers; i++ {
+		master.WorkerStates[i] = rpc.Idle
+		master.workerTimeouts[i] = time.Now()
+		master.startWorkerTimer(i)
+	}
+
+	return master
 }
 
 func (m *Master) SetServer(server *Server) {
 	m.Server = server
+}
+
+func (m *Master) startWorkerTimer(workerId int) {
+	if workerId >= len(m.workerTimers) {
+		return
+	}
+
+	if m.workerTimers[workerId] != nil {
+		m.workerTimers[workerId].Stop()
+	}
+
+	m.workerTimers[workerId] = time.AfterFunc(m.heartbeatTimeout, func() {
+		m.handleWorkerTimeout(workerId)
+	})
+}
+
+func (m *Master) resetWorkerTimer(workerId int) {
+	if workerId >= len(m.workerTimers) {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.WorkerStates[workerId] == rpc.Dead {
+		return
+	}
+
+	m.workerTimeouts[workerId] = time.Now()
+	m.startWorkerTimer(workerId)
+}
+
+func (m *Master) handleWorkerTimeout(workerId int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.WorkerStates[workerId] == rpc.Dead {
+		return
+	}
+
+	log.Printf("Worker %d timed out, marking as dead", workerId)
+
+	m.WorkerStates[workerId] = rpc.Dead
+	m.handleDeadWorker(workerId)
+}
+
+// TODO: 죽은 worker 가 하던 작업을 다른 worker 에게 재할당
+func (m *Master) handleDeadWorker(workerId int) {
+	log.Printf("Handling dead worker %d", workerId)
 }
 
 // RegisterWorker connects the master's RPC client to a worker's address for the given id.
@@ -124,7 +190,7 @@ func (m *Master) Run() {
 // 채널에서 chunk를 받아서 idle worker에게 할당
 func (m *Master) assignChunksToWorkers() {
 	for chunk := range m.ChunkChan {
-		for workerId := 0; workerId < m.NumMapWorkers; workerId++ {
+		for workerId := 1; workerId <= m.NumMapWorkers; workerId++ {
 			m.mu.Lock()
 			if m.WorkerStates[workerId] == rpc.Idle {
 				// Worker에게 Map 작업 요청 (비동기)
@@ -138,30 +204,37 @@ func (m *Master) assignChunksToWorkers() {
 					}
 					m.mu.Unlock()
 				}(workerId, chunk)
+				m.mu.Unlock()
+				break // 작업을 할당했으므로 루프 종료
+			} else {
+				m.mu.Unlock()
 			}
-			m.mu.Unlock()
-
 		}
 	}
 }
 
 func (m *Master) sendHeartbeats() {
-	for workerId := 0; workerId < m.NumMapWorkers; workerId++ {
+	for workerId := 1; workerId <= m.NumMapWorkers; workerId++ {
 		go func(id int) {
+			// Dead 워커에게는 하트비트를 보내지 않음
+			m.mu.Lock()
+			if m.WorkerStates[id] == rpc.Dead {
+				m.mu.Unlock()
+				return
+			}
+			m.mu.Unlock()
+
 			var args rpc.HeartbeatArgs
 			var reply rpc.HeartbeatReply
 			if err := m.Server.Call(id, "MapReduce.Heartbeat", args, &reply); err == nil {
-				m.mu.Lock()
-				m.WorkerStates[id] = reply.State
-				m.mu.Unlock()
+				m.resetWorkerTimer(id)
 			} else {
-				// Only log errors if the connection is not intentionally closed
 				select {
 				case <-m.stopChan:
-					// Master is shutting down, don't log connection errors
 					return
 				default:
 					log.Printf("failed to send heartbeat to worker %d: %v", id, err)
+					// 하트비트 실패 시에도 타이머는 계속 실행되어 타임아웃 감지
 				}
 			}
 		}(workerId)
@@ -204,6 +277,14 @@ func (m *Master) Shutdown() {
 	default:
 		close(m.stopChan)
 	}
+
+	// 모든 워커 타이머 정리
+	for i := 0; i < len(m.workerTimers); i++ {
+		if m.workerTimers[i] != nil {
+			m.workerTimers[i].Stop()
+		}
+	}
+
 	m.Server.Shutdown()
 }
 

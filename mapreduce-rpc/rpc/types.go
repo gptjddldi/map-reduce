@@ -25,8 +25,6 @@ const (
 type HeartbeatArgs struct {
 }
 type HeartbeatReply struct {
-	State WorkerState
-	Task  *MapChunk
 }
 
 type MapArgs struct {

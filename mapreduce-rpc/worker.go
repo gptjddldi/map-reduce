@@ -69,14 +69,6 @@ func (w *Worker) RegisterWorker(id int, addr net.Addr) error {
 }
 
 func (w *Worker) Heartbeat(args rpc.HeartbeatArgs, reply *rpc.HeartbeatReply) error {
-	if w.State == rpc.Idle {
-		reply.State = rpc.Idle
-		reply.Task = nil
-	} else {
-		log.Printf("[%v] Heartbeat Received. State: %v, Task: %v", w.Id, w.State, w.Task)
-		reply.State = w.State
-		reply.Task = w.Task
-	}
 	return nil
 }
 
