@@ -3,6 +3,7 @@ package mapreducerpc
 import (
 	"fmt"
 	"log"
+	"map-reduce/mapreduce-rpc/rpc"
 	"net"
 	"os"
 	"sync"
@@ -11,29 +12,16 @@ import (
 
 const ChunkSize = 1024 * 1 // 1KB
 
-type MapChunk struct {
-	StartIndex int
-	Length     int
-	State      ChunkState
-}
-
-type ChunkState int
-
-const (
-	Ready ChunkState = iota
-	Done
-)
-
 type Master struct {
 	Id int
 
 	Server *Server
 
-	Chunks    map[int]*MapChunk
-	ChunkChan chan *MapChunk
+	Chunks    map[int]*rpc.MapChunk
+	ChunkChan chan *rpc.MapChunk
 
 	NumMapWorkers int
-	WorkerStates  []WorkerState
+	WorkerStates  []rpc.WorkerState
 
 	inputFilePath string
 
@@ -47,45 +35,11 @@ type Master struct {
 	mu sync.Mutex
 }
 
-type HeartbeatArgs struct {
-}
-type HeartbeatReply struct {
-	State WorkerState
-	Task  *MapChunk
-}
-
-type MapArgs struct {
-	Chunk         *MapChunk
-	InputFilePath string
-}
-type MapReply struct {
-	isSuccess bool
-}
-type ReduceArgs struct {
-}
-type ReduceReply struct {
-}
-
-type GetIntermediateFilesArgs struct {
-}
-type GetIntermediateFilesReply struct {
-	Files   map[int]string // reduce task ID -> 파일 경로
-	Success bool
-}
-
-type DoneMapTaskArgs struct {
-	WorkerId int
-	Chunk    *MapChunk
-}
-type DoneMapTaskReply struct {
-	Success bool
-}
-
 func NewMaster(inputFilePath string, numMapWorkers int) *Master {
 	return &Master{
 		inputFilePath:   inputFilePath,
 		NumMapWorkers:   numMapWorkers,
-		WorkerStates:    make([]WorkerState, numMapWorkers),
+		WorkerStates:    make([]rpc.WorkerState, numMapWorkers),
 		completedChunks: make(map[int]bool),
 		allMapTasksDone: make(chan struct{}),
 		stopChan:        make(chan struct{}),
@@ -120,7 +74,7 @@ func (m *Master) Run() {
 	}()
 
 	// 1. Split InputFile into N parts (file's metadata)
-	m.Chunks = make(map[int]*MapChunk)
+	m.Chunks = make(map[int]*rpc.MapChunk)
 
 	file, err := os.Stat(m.inputFilePath)
 	if err != nil {
@@ -131,7 +85,7 @@ func (m *Master) Run() {
 	fileSize := file.Size()
 
 	numChunks := fileSize / int64(ChunkSize)
-	m.ChunkChan = make(chan *MapChunk, int(numChunks))
+	m.ChunkChan = make(chan *rpc.MapChunk, int(numChunks))
 	log.Printf("numChunks: %d", numChunks)
 	// Chunk 생성 및 채널 전송을 별도 고루틴으로 처리
 	m.wg.Add(1)
@@ -140,7 +94,7 @@ func (m *Master) Run() {
 		defer close(m.ChunkChan)
 
 		for i := 0; i < int(numChunks); i++ {
-			chunk := &MapChunk{
+			chunk := &rpc.MapChunk{
 				StartIndex: i * ChunkSize,
 				Length:     int(ChunkSize),
 			}
@@ -172,14 +126,14 @@ func (m *Master) assignChunksToWorkers() {
 	for chunk := range m.ChunkChan {
 		for workerId := 0; workerId < m.NumMapWorkers; workerId++ {
 			m.mu.Lock()
-			if m.WorkerStates[workerId] == Idle {
+			if m.WorkerStates[workerId] == rpc.Idle {
 				// Worker에게 Map 작업 요청 (비동기)
-				go func(workerId int, chunk *MapChunk) {
+				go func(workerId int, chunk *rpc.MapChunk) {
 					m.mu.Lock()
-					if m.WorkerStates[workerId] == Idle {
-						m.WorkerStates[workerId] = Mapping
-						request := MapArgs{Chunk: chunk, InputFilePath: m.inputFilePath}
-						var reply MapReply
+					if m.WorkerStates[workerId] == rpc.Idle {
+						m.WorkerStates[workerId] = rpc.Mapping
+						request := rpc.MapArgs{Chunk: chunk, InputFilePath: m.inputFilePath}
+						var reply rpc.MapReply
 						m.RequestMap(workerId, request, reply)
 					}
 					m.mu.Unlock()
@@ -194,8 +148,8 @@ func (m *Master) assignChunksToWorkers() {
 func (m *Master) sendHeartbeats() {
 	for workerId := 0; workerId < m.NumMapWorkers; workerId++ {
 		go func(id int) {
-			var args HeartbeatArgs
-			var reply HeartbeatReply
+			var args rpc.HeartbeatArgs
+			var reply rpc.HeartbeatReply
 			if err := m.Server.Call(id, "MapReduce.Heartbeat", args, &reply); err == nil {
 				m.mu.Lock()
 				m.WorkerStates[id] = reply.State
@@ -214,23 +168,23 @@ func (m *Master) sendHeartbeats() {
 	}
 }
 
-func (m *Master) RequestMap(workerId int, request MapArgs, reply MapReply) MapReply {
+func (m *Master) RequestMap(workerId int, request rpc.MapArgs, reply rpc.MapReply) rpc.MapReply {
 	if err := m.Server.Call(workerId, "MapReduce.Map", request, &reply); err == nil {
-		reply.isSuccess = true
+		reply.IsSuccess = true
 	} else {
-		reply.isSuccess = false
+		reply.IsSuccess = false
 	}
 	return reply
 }
 
-func (m *Master) RequestReduce(workerId int, request ReduceArgs, reply ReduceReply) {
+func (m *Master) RequestReduce(workerId int, request rpc.ReduceArgs, reply rpc.ReduceReply) {
 	m.Server.Call(workerId, "MapReduce.Reduce", request, reply)
 }
 
 // Worker로부터 중간 파일 위치 정보를 가져옴
 func (m *Master) GetIntermediateFiles(workerId int) (map[int]string, error) {
-	var args GetIntermediateFilesArgs
-	var reply GetIntermediateFilesReply
+	var args rpc.GetIntermediateFilesArgs
+	var reply rpc.GetIntermediateFilesReply
 
 	if err := m.Server.Call(workerId, "MapReduce.GetIntermediateFiles", args, &reply); err != nil {
 		return nil, err
@@ -254,7 +208,7 @@ func (m *Master) Shutdown() {
 }
 
 // DoneMapTask RPC 메서드: worker가 map task 완료를 알림
-func (m *Master) DoneMapTask(args DoneMapTaskArgs, reply *DoneMapTaskReply) error {
+func (m *Master) DoneMapTask(args rpc.DoneMapTaskArgs, reply *rpc.DoneMapTaskReply) error {
 	log.Printf("Map task completed by worker %d for chunk %d", args.WorkerId, args.Chunk.StartIndex)
 
 	m.mu.Lock()
@@ -266,7 +220,7 @@ func (m *Master) DoneMapTask(args DoneMapTaskArgs, reply *DoneMapTaskReply) erro
 
 	// worker 상태를 Idle로 변경
 	if args.WorkerId < len(m.WorkerStates) {
-		m.WorkerStates[args.WorkerId] = Idle
+		m.WorkerStates[args.WorkerId] = rpc.Idle
 	}
 
 	// 모든 chunk가 완료되었는지 확인

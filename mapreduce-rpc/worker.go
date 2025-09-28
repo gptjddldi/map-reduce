@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"map-reduce/mapreduce-rpc/rpc"
 	"net"
 	"os"
 	"path/filepath"
@@ -23,14 +24,14 @@ type ReduceFunc func(key string, values []string) KeyValue
 type Worker struct {
 	Id int
 
-	State WorkerState
-	Task  *MapChunk
+	State rpc.WorkerState
+	Task  *rpc.MapChunk
 
 	MapFn    MapFunc
 	ReduceFn ReduceFunc
 
 	Server   *Server
-	MasterId int // master의 ID
+	MasterId int
 
 	// 작업 결과 저장
 	LastResult []KeyValue
@@ -46,19 +47,10 @@ type Worker struct {
 	intermediateFiles map[int]string // reduce task ID -> 파일 경로
 }
 
-type WorkerState int
-
-const (
-	Idle WorkerState = iota
-	Mapping
-	Reducing
-	Dead
-)
-
 func NewWorker(id int, masterId int, numReduceTasks int, outputDir string) *Worker {
 	return &Worker{
 		Id:                 id,
-		State:              Idle,
+		State:              rpc.Idle,
 		Task:               nil,
 		intermediateBuffer: make(map[int][]KeyValue),
 		numReduceTasks:     numReduceTasks,
@@ -76,9 +68,9 @@ func (w *Worker) RegisterWorker(id int, addr net.Addr) error {
 	return w.Server.ConnectToPeer(id, addr)
 }
 
-func (w *Worker) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
-	if w.State == Idle {
-		reply.State = Idle
+func (w *Worker) Heartbeat(args rpc.HeartbeatArgs, reply *rpc.HeartbeatReply) error {
+	if w.State == rpc.Idle {
+		reply.State = rpc.Idle
 		reply.Task = nil
 	} else {
 		log.Printf("[%v] Heartbeat Received. State: %v, Task: %v", w.Id, w.State, w.Task)
@@ -88,16 +80,16 @@ func (w *Worker) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 	return nil
 }
 
-func (w *Worker) Map(args MapArgs, reply *MapReply) error {
+func (w *Worker) Map(args rpc.MapArgs, reply *rpc.MapReply) error {
 	log.Printf("[%v] Map Received", w.Id)
 
 	// 이미 작업 중이면 실패
-	if w.State != Idle {
-		reply.isSuccess = false
+	if w.State != rpc.Idle {
+		reply.IsSuccess = false
 		return nil
 	}
 
-	w.State = Mapping
+	w.State = rpc.Mapping
 	w.Task = args.Chunk
 
 	// 비동기로 Map 작업 실행
@@ -135,24 +127,24 @@ func (w *Worker) Map(args MapArgs, reply *MapReply) error {
 		log.Printf("[%v] Map completed, intermediate files: %v", w.Id, w.intermediateFiles)
 	}()
 
-	reply.isSuccess = true
+	reply.IsSuccess = true
 
 	return nil
 }
 
 func (w *Worker) doneMapTask() {
-	args := DoneMapTaskArgs{
+	args := rpc.DoneMapTaskArgs{
 		WorkerId: w.Id,
 		Chunk:    w.Task,
 	}
-	var reply DoneMapTaskReply
+	var reply rpc.DoneMapTaskReply
 	err := w.Server.Call(w.MasterId, "MapReduce.DoneMapTask", args, &reply)
 	if err != nil {
 		log.Printf("[%v] Failed to notify master of map task completion: %v", w.Id, err)
 	} else {
 		log.Printf("[%v] Successfully notified master of map task completion", w.Id)
 	}
-	w.State = Idle
+	w.State = rpc.Idle
 	w.Task = nil
 }
 
@@ -235,7 +227,7 @@ func (w *Worker) getIntermediateFiles() map[int]string {
 }
 
 // 중간 파일 위치를 반환하는 RPC 메서드
-func (w *Worker) GetIntermediateFiles(args GetIntermediateFilesArgs, reply *GetIntermediateFilesReply) error {
+func (w *Worker) GetIntermediateFiles(args rpc.GetIntermediateFilesArgs, reply *rpc.GetIntermediateFilesReply) error {
 	log.Printf("[%v] GetIntermediateFiles Received", w.Id)
 
 	reply.Files = w.getIntermediateFiles()
@@ -244,9 +236,9 @@ func (w *Worker) GetIntermediateFiles(args GetIntermediateFilesArgs, reply *GetI
 	return nil
 }
 
-func (w *Worker) Reduce(args ReduceArgs, reply *ReduceReply) error {
+func (w *Worker) Reduce(args rpc.ReduceArgs, reply *rpc.ReduceReply) error {
 	log.Printf("[%v] Reduce Received", w.Id)
-	w.State = Reducing
+	w.State = rpc.Reducing
 
 	return nil
 }

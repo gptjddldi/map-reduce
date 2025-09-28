@@ -40,10 +40,8 @@ func (s *Server) Serve() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("[%v] listening at %s", s.serverId, s.listener.Addr())
 	s.mu.Unlock()
 
-	// Register RPC handlers
 	s.mu.Lock()
 	s.rpcServer.RegisterName("MapReduce", s.handler)
 	s.mu.Unlock()

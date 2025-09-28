@@ -2,17 +2,18 @@ package mapreducerpc
 
 import (
 	"fmt"
+	"map-reduce/mapreduce-rpc/rpc"
 )
 
 type WorkerHandler interface {
-	Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error
-	Map(args MapArgs, reply *MapReply) error
-	Reduce(args ReduceArgs, reply *ReduceReply) error
-	GetIntermediateFiles(args GetIntermediateFilesArgs, reply *GetIntermediateFilesReply) error
+	Heartbeat(args rpc.HeartbeatArgs, reply *rpc.HeartbeatReply) error
+	Map(args rpc.MapArgs, reply *rpc.MapReply) error
+	Reduce(args rpc.ReduceArgs, reply *rpc.ReduceReply) error
+	GetIntermediateFiles(args rpc.GetIntermediateFilesArgs, reply *rpc.GetIntermediateFilesReply) error
 }
 
 type MasterHandler interface {
-	DoneMapTask(args DoneMapTaskArgs, reply *DoneMapTaskReply) error
+	DoneMapTask(args rpc.DoneMapTaskArgs, reply *rpc.DoneMapTaskReply) error
 }
 
 type Cluster struct {
@@ -26,7 +27,6 @@ func StartCluster(inputFilePath string, numWorkers int, numReduceTasks int, mapF
 	masterServer := NewServer("master", master)
 	master.SetServer(masterServer)
 
-	// RPC 등록 후 서버 시작
 	masterServer.Serve()
 
 	workerServers := make([]*Server, 0, numWorkers)
