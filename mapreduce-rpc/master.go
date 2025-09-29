@@ -17,8 +17,7 @@ type Master struct {
 
 	Server *Server
 
-	Chunks    map[int]*rpc.MapChunk
-	ChunkChan chan *rpc.MapChunk
+	Chunks map[int]*rpc.MapChunk
 
 	NumMapWorkers int
 	WorkerStates  []rpc.WorkerState
@@ -28,6 +27,8 @@ type Master struct {
 	// 완료된 task 추적
 	completedChunks map[int]bool  // chunk index -> 완료 여부
 	allMapTasksDone chan struct{} // 모든 map task 완료 신호
+
+	chunkQueue chan *rpc.MapChunk
 
 	// 워커별 타이머 관리
 	workerTimers     []*time.Timer // 워커별 하트비트 타이머
@@ -123,9 +124,7 @@ func (m *Master) RegisterWorker(id int, addr net.Addr) error {
 }
 
 func (m *Master) Run() {
-	m.wg.Add(1)
 	go func() {
-		defer m.wg.Done()
 		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -139,7 +138,6 @@ func (m *Master) Run() {
 		}
 	}()
 
-	// 1. Split InputFile into N parts (file's metadata)
 	m.Chunks = make(map[int]*rpc.MapChunk)
 
 	file, err := os.Stat(m.inputFilePath)
@@ -151,66 +149,53 @@ func (m *Master) Run() {
 	fileSize := file.Size()
 
 	numChunks := fileSize / int64(ChunkSize)
-	m.ChunkChan = make(chan *rpc.MapChunk, int(numChunks))
 	log.Printf("numChunks: %d", numChunks)
-	// Chunk 생성 및 채널 전송을 별도 고루틴으로 처리
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		defer close(m.ChunkChan)
 
-		for i := 0; i < int(numChunks); i++ {
-			chunk := &rpc.MapChunk{
-				StartIndex: i * ChunkSize,
-				Length:     int(ChunkSize),
-			}
-			m.Chunks[i] = chunk
-			m.ChunkChan <- chunk
+	m.chunkQueue = make(chan *rpc.MapChunk, numChunks)
+	// Chunk 생성
+	for i := 0; i < int(numChunks); i++ {
+		chunk := &rpc.MapChunk{
+			StartIndex: i * ChunkSize,
+			Length:     int(ChunkSize),
 		}
-	}()
+		m.Chunks[i] = chunk
+		m.chunkQueue <- chunk
+	}
 
-	// Worker에게 chunk 할당하는 고루틴
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		m.assignChunksToWorkers()
-	}()
+	for workerId := 1; workerId <= m.NumMapWorkers; workerId++ {
+        m.wg.Add(1)
+        go m.workerLoop(workerId)
+    }
+
+	m.wg.Wait()
 
 	// 모든 map task 완료 대기
 	<-m.allMapTasksDone
 	log.Printf("All map tasks completed, proceeding to next phase...")
 
-	// Wait for all goroutines to complete
-	m.wg.Wait()
-
 	// 여기에 다음 로직 (예: reduce phase) 추가 가능
 	m.Shutdown()
 }
 
-// 채널에서 chunk를 받아서 idle worker에게 할당
-func (m *Master) assignChunksToWorkers() {
-	for chunk := range m.ChunkChan {
-		for workerId := 1; workerId <= m.NumMapWorkers; workerId++ {
-			m.mu.Lock()
-			if m.WorkerStates[workerId] == rpc.Idle {
-				// Worker에게 Map 작업 요청 (비동기)
-				go func(workerId int, chunk *rpc.MapChunk) {
-					m.mu.Lock()
-					if m.WorkerStates[workerId] == rpc.Idle {
-						m.WorkerStates[workerId] = rpc.Mapping
-						request := rpc.MapArgs{Chunk: chunk, InputFilePath: m.inputFilePath}
-						var reply rpc.MapReply
-						m.RequestMap(workerId, request, reply)
-					}
-					m.mu.Unlock()
-				}(workerId, chunk)
-				m.mu.Unlock()
-				break // 작업을 할당했으므로 루프 종료
-			} else {
-				m.mu.Unlock()
-			}
+func (m *Master) workerLoop(workerId int) {
+	defer m.wg.Done()
+	for chunk := range m.chunkQueue {
+		log.Printf("Worker %d started", workerId)
+		m.mu.Lock()
+		if m.WorkerStates[workerId] == rpc.Dead {
+			m.mu.Unlock()
+			return
 		}
-	}
+		m.mu.Unlock()
+        
+        request := rpc.MapArgs{Chunk: chunk, InputFilePath: m.inputFilePath}
+        var reply rpc.MapReply
+
+        if err := m.Server.Call(workerId, "MapReduce.Map", request, &reply); err != nil || !reply.IsSuccess {
+            log.Printf("Map task failed for chunk %d. Re-queueing.", chunk.StartIndex)
+            m.chunkQueue <- chunk
+        }
+    }
 }
 
 func (m *Master) sendHeartbeats() {
@@ -242,9 +227,7 @@ func (m *Master) sendHeartbeats() {
 }
 
 func (m *Master) RequestMap(workerId int, request rpc.MapArgs, reply rpc.MapReply) rpc.MapReply {
-	if err := m.Server.Call(workerId, "MapReduce.Map", request, &reply); err == nil {
-		reply.IsSuccess = true
-	} else {
+	if err := m.Server.Call(workerId, "MapReduce.Map", request, &reply); err != nil {
 		reply.IsSuccess = false
 	}
 	return reply
@@ -299,18 +282,14 @@ func (m *Master) DoneMapTask(args rpc.DoneMapTaskArgs, reply *rpc.DoneMapTaskRep
 	chunkIndex := args.Chunk.StartIndex / ChunkSize
 	m.completedChunks[chunkIndex] = true
 
-	// worker 상태를 Idle로 변경
-	if args.WorkerId < len(m.WorkerStates) {
-		m.WorkerStates[args.WorkerId] = rpc.Idle
-	}
+	m.WorkerStates[args.WorkerId] = rpc.Idle
 
 	// 모든 chunk가 완료되었는지 확인
-	if len(m.completedChunks) == len(m.Chunks) {
+	if len(m.completedChunks) == len(m.Chunks){
 		log.Printf("All map tasks completed!")
+		close(m.chunkQueue)
 		close(m.allMapTasksDone)
-	} else {
-		log.Printf("left chunks: %d", len(m.Chunks)-len(m.completedChunks))
-	}
+	} 
 
 	reply.Success = true
 	return nil
