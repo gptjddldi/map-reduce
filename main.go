@@ -1,61 +1,61 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	mapreducerpc "map-reduce/mapreduce-rpc"
-	"strings"
+	"os"
+	"plugin"
 )
 
 func main() {
-	mapFn := func(data mapreducerpc.KeyValue) []mapreducerpc.KeyValue {
-		// Delegate to defaultWordCount in worker if nil; here implement a simple splitter
-		counts := make([]mapreducerpc.KeyValue, 0)
-		start := -1
-		lower := func(b byte) byte {
-			if b >= 'A' && b <= 'Z' {
-				return b - 'A' + 'a'
-			}
-			return b
-		}
-		isAlnum := func(b byte) bool {
-			return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
-		}
-		for i := 0; i <= len(data.Value); i++ {
-			if i < len(data.Value) && isAlnum(data.Value[i]) {
-				if start == -1 {
-					start = i
-				}
-				continue
-			}
-			if start != -1 {
-				wordBytes := make([]byte, i-start)
-				for j := start; j < i; j++ {
-					wordBytes[j-start] = lower(data.Value[j])
-				}
-				counts = append(counts, mapreducerpc.KeyValue{Key: string(wordBytes), Value: data.Key})
-				start = -1
-			}
-		}
-		return counts
+	if len(os.Args) != 2 {
+		fmt.Fprintf(os.Stderr, "Usage: go run main.go xxx.so\n")
+		os.Exit(1)
 	}
 
-	reduceFn := func(key string, values []string) mapreducerpc.KeyValue {
-		counts := make([]mapreducerpc.KeyValue, 0)
-		for _, v := range values {
-			counts = append(counts, mapreducerpc.KeyValue{Key: key, Value: v})
-		}
-		return mapreducerpc.KeyValue{Key: key, Value: strings.Join(values, ",")}
+	mapf, reducef, err := loadPlugin(os.Args[1])
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	cluster, err := mapreducerpc.StartCluster("large_file.txt", 10, 3, mapreducerpc.MapFunc(mapFn), mapreducerpc.ReduceFunc(reduceFn))
+	cluster, err := mapreducerpc.StartCluster("large_file.txt", 10, 3, mapf, reducef)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	defer cluster.Shutdown()
 
-	// Run the cluster and wait for completion
 	cluster.Run()
 
 	log.Println("MapReduce job completed successfully!")
+}
+
+func loadPlugin(path string) (mapreducerpc.MapFunc, mapreducerpc.ReduceFunc, error) {
+	p, err := plugin.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	mapFn, err := p.Lookup("Map")
+	if err != nil {
+		return nil, nil, err
+	}
+	reduceFn, err := p.Lookup("Reduce")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 타입 캐스팅을 명시적으로 수행
+	mapFunc, ok := mapFn.(func(mapreducerpc.KeyValue) []mapreducerpc.KeyValue)
+	if !ok {
+		return nil, nil, fmt.Errorf("Map function has wrong signature")
+	}
+
+	reduceFunc, ok := reduceFn.(func(string, []string) mapreducerpc.KeyValue)
+	if !ok {
+		return nil, nil, fmt.Errorf("Reduce function has wrong signature")
+	}
+
+	return mapFunc, reduceFunc, nil
 }
