@@ -163,15 +163,19 @@ func (m *Master) Run() {
 	}
 
 	for workerId := 1; workerId <= m.NumMapWorkers; workerId++ {
-        m.wg.Add(1)
-        go m.workerLoop(workerId)
-    }
+		m.wg.Add(1)
+		go m.workerLoop(workerId)
+	}
 
 	m.wg.Wait()
 
 	// 모든 map task 완료 대기
 	<-m.allMapTasksDone
 	log.Printf("All map tasks completed, proceeding to next phase...")
+
+	for workerId := 1; workerId <= m.NumMapWorkers; workerId++ {
+		m.requestShutdown(workerId)
+	}
 
 	// 여기에 다음 로직 (예: reduce phase) 추가 가능
 	m.Shutdown()
@@ -187,15 +191,19 @@ func (m *Master) workerLoop(workerId int) {
 			return
 		}
 		m.mu.Unlock()
-        
-        request := rpc.MapArgs{Chunk: chunk, InputFilePath: m.inputFilePath}
-        var reply rpc.MapReply
 
-        if err := m.Server.Call(workerId, "MapReduce.Map", request, &reply); err != nil || !reply.IsSuccess {
-            log.Printf("Map task failed for chunk %d. Re-queueing.", chunk.StartIndex)
-            m.chunkQueue <- chunk
-        }
-    }
+		request := rpc.MapArgs{Chunk: chunk, InputFilePath: m.inputFilePath}
+		var reply rpc.MapReply
+
+		if err := m.Server.Call(workerId, "MapReduce.Map", request, &reply); err != nil || !reply.IsSuccess {
+			log.Printf("Map task failed for chunk %d. Re-queueing.", chunk.StartIndex)
+			m.chunkQueue <- chunk
+		}
+	}
+}
+
+func (m *Master) requestShutdown(workerId int) {
+	m.Server.Call(workerId, "MapReduce.Shutdown", struct{}{}, struct{}{})
 }
 
 func (m *Master) sendHeartbeats() {
@@ -285,11 +293,11 @@ func (m *Master) DoneMapTask(args rpc.DoneMapTaskArgs, reply *rpc.DoneMapTaskRep
 	m.WorkerStates[args.WorkerId] = rpc.Idle
 
 	// 모든 chunk가 완료되었는지 확인
-	if len(m.completedChunks) == len(m.Chunks){
+	if len(m.completedChunks) == len(m.Chunks) {
 		log.Printf("All map tasks completed!")
 		close(m.chunkQueue)
 		close(m.allMapTasksDone)
-	} 
+	}
 
 	reply.Success = true
 	return nil

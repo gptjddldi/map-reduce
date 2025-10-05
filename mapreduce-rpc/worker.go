@@ -37,15 +37,16 @@ type Worker struct {
 	LastResult []KeyValue
 	LastError  error
 
-	// MapReduce 논문에 따른 중간 결과 버퍼링
 	intermediateBuffer map[int][]KeyValue // R개 영역으로 분할된 버퍼
 	bufferMutex        sync.RWMutex
 	numReduceTasks     int    // R 값
 	outputDir          string // 중간 결과 저장 디렉토리
+	currentBufferSize  int    // 현재 버퍼 크기
 
-	// 파일 위치 정보
-	intermediateFiles map[int]string // reduce task ID -> 파일 경로
+	intermediateFiles map[int]string
 }
+
+const bufferCapacity = 1024 * 1024 * 0.5 // 1MB
 
 func NewWorker(id int, masterId int, numReduceTasks int, outputDir string) *Worker {
 	return &Worker{
@@ -55,6 +56,7 @@ func NewWorker(id int, masterId int, numReduceTasks int, outputDir string) *Work
 		intermediateBuffer: make(map[int][]KeyValue),
 		numReduceTasks:     numReduceTasks,
 		outputDir:          outputDir,
+		currentBufferSize:  0,
 		intermediateFiles:  make(map[int]string),
 		MasterId:           masterId,
 	}
@@ -87,7 +89,7 @@ func (w *Worker) Map(args rpc.MapArgs, reply *rpc.MapReply) error {
 	// 비동기로 Map 작업 실행
 	go func() {
 		defer func() {
-			w.doneMapTask()
+			w.doneMapTask(w.Id, w.Task)
 		}()
 
 		f, err := os.Open(args.InputFilePath)
@@ -108,12 +110,7 @@ func (w *Worker) Map(args rpc.MapArgs, reply *rpc.MapReply) error {
 
 		// Map 함수 실행
 		result := w.MapFn(KeyValue{Key: args.InputFilePath, Value: string(buf)})
-
-		// 중간 결과를 R개 영역으로 분할하여 버퍼에 저장
 		w.bufferIntermediateResults(result)
-
-		// 주기적으로 버퍼를 디스크에 저장
-		w.flushBufferToDisk()
 
 		w.LastError = nil
 		log.Printf("[%v] Map completed, intermediate files: %v", w.Id, w.intermediateFiles)
@@ -124,10 +121,10 @@ func (w *Worker) Map(args rpc.MapArgs, reply *rpc.MapReply) error {
 	return nil
 }
 
-func (w *Worker) doneMapTask() {
+func (w *Worker) doneMapTask(id int, chunk *rpc.MapChunk) {
 	args := rpc.DoneMapTaskArgs{
-		WorkerId: w.Id,
-		Chunk:    w.Task,
+		WorkerId: id,
+		Chunk:    chunk,
 	}
 	var reply rpc.DoneMapTaskReply
 	err := w.Server.Call(w.MasterId, "MapReduce.DoneMapTask", args, &reply)
@@ -151,12 +148,20 @@ func (w *Worker) hash(key string) int {
 
 // 중간 결과를 R개 영역으로 분할하여 버퍼에 저장
 func (w *Worker) bufferIntermediateResults(results []KeyValue) {
-	w.bufferMutex.Lock()
-	defer w.bufferMutex.Unlock()
 
 	for _, kv := range results {
+		w.bufferMutex.Lock()
+
 		reduceTaskId := w.hash(kv.Key)
 		w.intermediateBuffer[reduceTaskId] = append(w.intermediateBuffer[reduceTaskId], kv)
+		w.currentBufferSize++
+
+		w.bufferMutex.Unlock()
+	}
+
+	// 버퍼 용량이 임계값을 초과하면 디스크에 저장
+	if w.currentBufferSize >= bufferCapacity {
+		w.flushBufferToDisk() // 이미 락을 잡고 있으므로 unsafe 버전 사용
 	}
 }
 
@@ -165,7 +170,6 @@ func (w *Worker) flushBufferToDisk() {
 	w.bufferMutex.Lock()
 	defer w.bufferMutex.Unlock()
 
-	// 출력 디렉토리 생성
 	if err := os.MkdirAll(w.outputDir, 0755); err != nil {
 		log.Printf("[%v] Failed to create output directory: %v", w.Id, err)
 		return
@@ -178,9 +182,7 @@ func (w *Worker) flushBufferToDisk() {
 		}
 
 		// 파일명: workerId_mapTaskId_reduceTaskId.json
-		filename := fmt.Sprintf("worker_%d_map_%d_reduce_%d.json",
-			w.Id, w.Task.StartIndex, reduceTaskId)
-		filepath := filepath.Join(w.outputDir, filename)
+		filepath := w.generateOutputFilePath(reduceTaskId)
 
 		// JSON으로 저장
 		file, err := os.Create(filepath)
@@ -203,26 +205,14 @@ func (w *Worker) flushBufferToDisk() {
 
 	// 버퍼 초기화
 	w.intermediateBuffer = make(map[int][]KeyValue)
-}
-
-// 중간 파일 위치 정보를 반환 (내부용)
-func (w *Worker) getIntermediateFiles() map[int]string {
-	w.bufferMutex.RLock()
-	defer w.bufferMutex.RUnlock()
-
-	// 복사본 반환
-	files := make(map[int]string)
-	for k, v := range w.intermediateFiles {
-		files[k] = v
-	}
-	return files
+	w.currentBufferSize = 0
 }
 
 // 중간 파일 위치를 반환하는 RPC 메서드
 func (w *Worker) GetIntermediateFiles(args rpc.GetIntermediateFilesArgs, reply *rpc.GetIntermediateFilesReply) error {
 	log.Printf("[%v] GetIntermediateFiles Received", w.Id)
 
-	reply.Files = w.getIntermediateFiles()
+	reply.Files = w.intermediateFiles
 	reply.Success = true
 
 	return nil
@@ -233,4 +223,15 @@ func (w *Worker) Reduce(args rpc.ReduceArgs, reply *rpc.ReduceReply) error {
 	w.State = rpc.Reducing
 
 	return nil
+}
+
+// Shutdown worker and flush any remaining buffer data
+func (w *Worker) Shutdown(args struct{}, reply struct{}) {
+	log.Printf("[%v] Shutting down worker", w.Id)
+	w.flushBufferToDisk()
+	log.Printf("[%v] Worker shutdown complete", w.Id)
+}
+
+func (w *Worker) generateOutputFilePath(reduceTaskId int) string {
+	return filepath.Join(w.outputDir, fmt.Sprintf("worker_%d_map_%d_reduce_%d.json", w.Id, w.Task.StartIndex, reduceTaskId))
 }
